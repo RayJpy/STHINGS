@@ -1,21 +1,20 @@
 import sqlite3
 import os
+import io
 from flask import Flask, render_template_string, send_file
 from flask_socketio import SocketIO, emit
-import io
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'bi_mat_123456'
 
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-MAX_FILES = 10  # Số lượng file tối đa muốn lưu trữ (có thể thay đổi)
+MAX_FILES = 10  # Số lượng file tối đa muốn lưu trữ
 
 # 1. KHỞI TẠO CƠ SỞ DỮ LIỆU SQLITE
 def init_db():
     conn = sqlite3.connect('txt_storage.db')
     cursor = conn.cursor()
-    # Tạo bảng lưu vết các file txt
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS txt_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +40,7 @@ HTML_CODE = """
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 0; padding: 20px; display: flex; justify-content: center; }
-        .container { width: 100%; max-width: 700px; background: #2b2b3b; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); }
+        .container { width: 100%; max-width: 750px; background: #2b2b3b; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); }
         h2 { text-align: center; margin-top: 0; color: #89b4fa; }
         .upload-area { border: 2px dashed #45475a; border-radius: 8px; padding: 20px; text-align: center; background: #181825; margin-bottom: 20px; cursor: pointer; }
         .upload-area:hover { border-color: #89b4fa; }
@@ -53,16 +52,30 @@ HTML_CODE = """
         .file-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
         .file-name { font-weight: bold; color: #f9e2af; word-break: break-all; }
         .file-meta { font-size: 0.8em; color: #a6adc8; }
-        .file-preview { background: #11111b; padding: 10px; border-radius: 6px; font-family: monospace; white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow-y: auto; font-size: 0.9em; margin-bottom: 10px; border: 1px solid #45475a; }
-        .download-btn { padding: 6px 12px; background: #a6e3a1; border: none; border-radius: 4px; color: #11111b; font-weight: bold; text-decoration: none; cursor: pointer; font-size: 0.85em; display: inline-block; }
-        .download-btn:hover { background: #94e2d5; }
+        .file-preview { background: #11111b; padding: 10px; border-radius: 6px; font-family: monospace; white-space: pre-wrap; word-break: break-all; max-height: 100px; overflow-y: auto; font-size: 0.9em; margin-bottom: 12px; border: 1px solid #45475a; }
+        .action-btns { display: flex; gap: 8px; }
+        .btn { padding: 6px 12px; border: none; border-radius: 4px; font-weight: bold; text-decoration: none; cursor: pointer; font-size: 0.85em; display: inline-block; }
+        .btn-view { background: #89b4fa; color: #11111b; }
+        .btn-view:hover { background: #b4befe; }
+        .btn-modal { background: #f9e2af; color: #11111b; }
+        .btn-modal:hover { background: #fae3b0; }
+        .btn-download { background: #a6e3a1; color: #11111b; }
+        .btn-download:hover { background: #94e2d5; }
+        
+        /* Style cho Modal Popup */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.7); z-index: 1000; justify-content: center; align-items: center; }
+        .modal-box { background: #2b2b3b; width: 90%; max-width: 700px; height: 80vh; padding: 20px; border-radius: 12px; display: flex; flex-direction: column; box-shadow: 0 5px 20px rgba(0,0,0,0.5); }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .modal-title { color: #89b4fa; margin: 0; font-size: 1.2em; word-break: break-all; }
+        .modal-content-area { flex: 1; background: #11111b; color: #cdd6f4; border: 1px solid #45475a; padding: 12px; font-family: monospace; font-size: 0.9em; border-radius: 6px; resize: none; outline: none; }
+        .modal-close { margin-top: 12px; align-self: flex-end; background: #f38ba8; color: #11111b; }
     </style>
 </head>
 <body>
 
 <div class="container">
     <h2>Kho Lưu Trữ File TXT Gần Nhất</h2>
-    
+
     <div class="upload-area" onclick="document.getElementById('fileInput').click()">
         <p style="margin:0;">Kéo thả hoặc nhấn vào đây để chọn file <strong>.txt</strong></p>
         <input type="file" id="fileInput" accept=".txt" onchange="uploadFile(this.files)">
@@ -72,17 +85,26 @@ HTML_CODE = """
     <div id="file-list"></div>
 </div>
 
+<!-- Modal Popup Xem Nhanh -->
+<div id="viewModal" class="modal-overlay">
+    <div class="modal-box">
+        <div class="modal-header">
+            <h3 id="modalTitle" class="modal-title"></h3>
+        </div>
+        <textarea id="modalContent" class="modal-content-area" readonly></textarea>
+        <button class="btn modal-close" onclick="closeModal()">Đóng</button>
+    </div>
+</div>
+
 <script>
     const socket = io();
     const fileListDiv = document.getElementById('file-list');
 
-    // Lắng nghe danh sách file khi vừa vào trang
     socket.on('load_files', function(files) {
         fileListDiv.innerHTML = '';
         files.forEach(file => appendFileUI(file));
     });
 
-    // Lắng nghe khi có file mới tải lên từ bất kỳ ai
     socket.on('new_file', function(files) {
         fileListDiv.innerHTML = '';
         files.forEach(file => appendFileUI(file));
@@ -91,13 +113,22 @@ HTML_CODE = """
     function appendFileUI(file) {
         const card = document.createElement('div');
         card.className = 'file-card';
+        
+        // Encode an toàn dữ liệu để truyền vào hàm onclick JavaScript
+        const encodedContent = encodeURIComponent(file.content);
+        const encodedFilename = encodeURIComponent(file.filename);
+
         card.innerHTML = `
             <div class="file-header">
-                <span class="file-name">📄 ${file.filename}</span>
+                <span class="file-name">📄 ${escapeHtml(file.filename)}</span>
                 <span class="file-meta">${file.filesize} bytes | ${file.timestamp}</span>
             </div>
             <div class="file-preview">${escapeHtml(file.content)}</div>
-            <a href="/download/${file.id}" class="download-btn">Tải về (.txt)</a>
+            <div class="action-btns">
+                <button onclick="openModal('${encodedFilename}', '${encodedContent}')" class="btn btn-modal">Xem nhanh</button>
+                <a href="/view/${file.id}" target="_blank" class="btn btn-view">Mở Tab mới</a>
+                <a href="/download/${file.id}" class="btn btn-download">Tải về (.txt)</a>
+            </div>
         `;
         fileListDiv.appendChild(card);
     }
@@ -124,6 +155,16 @@ HTML_CODE = """
         reader.readAsText(file);
     }
 
+    function openModal(encFilename, encContent) {
+        document.getElementById('modalTitle').innerText = decodeURIComponent(encFilename);
+        document.getElementById('modalContent').value = decodeURIComponent(encContent);
+        document.getElementById('viewModal').style.display = 'flex';
+    }
+
+    function closeModal() {
+        document.getElementById('viewModal').style.display = 'none';
+    }
+
     function escapeHtml(text) {
         return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
@@ -140,7 +181,7 @@ def get_recent_files():
     cursor.execute("SELECT id, filename, content, filesize, timestamp FROM txt_files ORDER BY id DESC LIMIT ?", (MAX_FILES,))
     rows = cursor.fetchall()
     conn.close()
-    
+
     return [{
         'id': row[0],
         'filename': row[1],
@@ -153,6 +194,19 @@ def get_recent_files():
 def index():
     return render_template_string(HTML_CODE)
 
+@app.route('/view/<int:file_id>')
+def view_file(file_id):
+    """API xem trực tiếp toàn bộ nội dung file dạng văn bản trên tab trình duyệt mới"""
+    conn = sqlite3.connect('txt_storage.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT content FROM txt_files WHERE id = ?", (file_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        return row[0], 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    return "File không tồn tại", 404
+
 @app.route('/download/<int:file_id>')
 def download_file(file_id):
     """API hỗ trợ tải file về máy"""
@@ -164,7 +218,6 @@ def download_file(file_id):
 
     if row:
         filename, content = row
-        # Tạo file stream từ bộ nhớ để cho người dùng tải về
         buffer = io.BytesIO()
         buffer.write(content.encode('utf-8'))
         buffer.seek(0)
@@ -178,7 +231,6 @@ def download_file(file_id):
 
 @socketio.on('connect')
 def handle_connect():
-    # Gửi danh sách các file hiện có cho người dùng mới kết nối
     emit('load_files', get_recent_files())
 
 @socketio.on('upload_txt')
@@ -190,13 +242,11 @@ def handle_upload(data):
     if content.strip():
         conn = sqlite3.connect('txt_storage.db')
         cursor = conn.cursor()
-        
-        # 1. Thêm file mới vào cơ sở dữ liệu
+
         cursor.execute("INSERT INTO txt_files (filename, content, filesize) VALUES (?, ?, ?)", 
                        (filename, content, filesize))
         conn.commit()
 
-        # 2. Xóa các file cũ vượt quá giới hạn MAX_FILES (để giữ kho lưu trữ luôn sạch)
         cursor.execute("""
             DELETE FROM txt_files 
             WHERE id NOT IN (
@@ -206,8 +256,9 @@ def handle_upload(data):
         conn.commit()
         conn.close()
 
-        # 3. Phát danh sách file cập nhật tới tất cả người dùng
         emit('new_file', get_recent_files(), broadcast=True)
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host='0.0.0.0', port=port, debug=True)
+    
