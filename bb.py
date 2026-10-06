@@ -8,21 +8,24 @@ from flask_socketio import SocketIO, emit
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
 
+# Cho phép kết nối SocketIO từ mọi nguồn
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-MAX_FILES = 10  # Số lượng file tối đa lưu trữ
-
-DATABASE_URL = os.environ.get(
-    'DATABASE_URL', 
-    'postgresql://postgres:password@localhost:5432/postgres'
-)
+MAX_FILES = 10  # Số lượng file tối đa lưu trữ trong DB
 
 def get_db_connection():
-    """Tạo kết nối tới PostgreSQL với cấu hình SSL tự động cho Neon.tech"""
-    db_url = DATABASE_URL
+    """Tạo kết nối tới PostgreSQL Neon.tech với tự động cấu hình SSL"""
+    db_url = os.environ.get('DATABASE_URL')
+    
+    # Bắt lỗi ngay nếu quên đặt DATABASE_URL trên Render Environment
+    if not db_url:
+        raise ValueError("Chưa cấu hình biến môi trường DATABASE_URL trên Render Environment!")
+        
+    # Ép prefix postgresql:// nếu chuỗi bắt đầu bằng postgres://
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     
+    # Thêm tham số sslmode=require bắt buộc cho Neon.tech Cloud
     if "sslmode" not in db_url and "localhost" not in db_url:
         if "?" in db_url:
             db_url += "&sslmode=require"
@@ -32,6 +35,7 @@ def get_db_connection():
     conn = psycopg2.connect(db_url)
     return conn
 
+# 1. KHỞI TẠO CƠ SỞ DỮ LIỆU POSTGRESQL
 def init_db():
     try:
         conn = get_db_connection()
@@ -48,12 +52,14 @@ def init_db():
         conn.commit()
         cursor.close()
         conn.close()
-        print(">>> Khởi tạo PostgreSQL Database thành công!")
+        print(">>> [SUCCESS] Khởi tạo PostgreSQL Database thành công!")
     except Exception as e:
-        print(f">>> Lỗi kết nối CSDL PostgreSQL: {e}")
+        print(f">>> [ERROR] Lỗi khởi tạo CSDL PostgreSQL: {e}")
 
+# Call khởi tạo bảng khi app chạy
 init_db()
 
+# 2. GIAO DIỆN HTML + JAVASCRIPT
 HTML_CODE = """
 <!DOCTYPE html>
 <html lang="vi">
@@ -99,10 +105,10 @@ HTML_CODE = """
 <div class="container">
     <h2>Kho Lưu Trữ File TXT (PostgreSQL)</h2>
 
-    <div class="upload-area" id="dropArea">
-        <p style="margin:0;">Kéo thả hoặc nhấn vào nút bên dưới để chọn file <strong>.txt</strong></p>
+    <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+        <p style="margin:0;">Kéo thả hoặc nhấn vào đây để chọn file <strong>.txt</strong></p>
         <input type="file" id="fileInput" accept=".txt">
-        <button class="btn-upload" onclick="document.getElementById('fileInput').click()">Tải file lên</button>
+        <button class="btn-upload" type="button">Tải file lên</button>
     </div>
 
     <div id="file-list"></div>
@@ -133,6 +139,10 @@ HTML_CODE = """
 
     socket.on('load_files', renderFiles);
     socket.on('new_file', renderFiles);
+    
+    socket.on('error_msg', function(data) {
+        alert('Lỗi Server DB: ' + data.error);
+    });
 
     function renderFiles(files) {
         fileListDiv.innerHTML = '';
@@ -209,6 +219,7 @@ HTML_CODE = """
 """
 
 def get_recent_files():
+    """Lấy danh sách MAX_FILES gần nhất"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -222,7 +233,7 @@ def get_recent_files():
         conn.close()
         return [dict(row) for row in rows]
     except Exception as e:
-        print(f">>> Lỗi lấy file: {e}")
+        print(f">>> Lỗi get_recent_files: {e}")
         return []
 
 @app.route('/')
@@ -285,12 +296,14 @@ def handle_upload(data):
             conn = get_db_connection()
             cursor = conn.cursor()
 
+            # 1. Chèn file mới
             cursor.execute(
                 "INSERT INTO txt_files (filename, content, filesize) VALUES (%s, %s, %s)", 
                 (filename, content, filesize)
             )
             conn.commit()
 
+            # 2. Xóa bớt file cũ quá giới hạn MAX_FILES
             cursor.execute("""
                 DELETE FROM txt_files 
                 WHERE id NOT IN (
@@ -302,9 +315,11 @@ def handle_upload(data):
             cursor.close()
             conn.close()
 
+            # Bắn danh sách mới về toàn bộ client
             emit('new_file', get_recent_files(), broadcast=True)
         except Exception as e:
-            print(f">>> Lỗi upload: {e}")
+            print(f">>> Lỗi upload_txt: {e}")
+            emit('error_msg', {'error': str(e)})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
