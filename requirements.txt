@@ -5,3 +5,4 @@ simple-websocket
 packaging
 gevent
 gevent-websocket
+psycopg2-binary
