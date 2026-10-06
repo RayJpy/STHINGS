@@ -3,3 +3,5 @@ Flask-SocketIO
 gunicorn
 simple-websocket
 packaging
+gevent
+gevent-websocket
