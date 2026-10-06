@@ -8,25 +8,21 @@ from flask_socketio import SocketIO, emit
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
 
-# Cho phép kết nối từ mọi nguồn
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-MAX_FILES = 10  # Số lượng file tối đa muốn lưu trữ
+MAX_FILES = 10  # Số lượng file tối đa lưu trữ
 
-# Lấy DATABASE_URL từ Render/Environment
 DATABASE_URL = os.environ.get(
     'DATABASE_URL', 
     'postgresql://postgres:password@localhost:5432/postgres'
 )
 
 def get_db_connection():
-    """Hàm tạo kết nối tới PostgreSQL với cấu hình tự sửa lỗi SSL cho Neon.tech"""
+    """Tạo kết nối tới PostgreSQL với cấu hình SSL tự động cho Neon.tech"""
     db_url = DATABASE_URL
-    # Ép prefix postgresql:// nếu Neon trả về postgres://
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
     
-    # Bắt buộc bật SSL Mode nếu dùng Neon.tech trên cloud
     if "sslmode" not in db_url and "localhost" not in db_url:
         if "?" in db_url:
             db_url += "&sslmode=require"
@@ -36,7 +32,6 @@ def get_db_connection():
     conn = psycopg2.connect(db_url)
     return conn
 
-# 1. KHỞI TẠO CƠ SỞ DỮ LIỆU POSTGRESQL
 def init_db():
     try:
         conn = get_db_connection()
@@ -57,10 +52,8 @@ def init_db():
     except Exception as e:
         print(f">>> Lỗi kết nối CSDL PostgreSQL: {e}")
 
-# Gọi hàm khởi tạo DB khi app chạy
 init_db()
 
-# 2. GIAO DIỆN HTML + JAVASCRIPT
 HTML_CODE = """
 <!DOCTYPE html>
 <html lang="vi">
@@ -73,7 +66,7 @@ HTML_CODE = """
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { width: 100%; max-width: 750px; background: #2b2b3b; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); }
         h2 { text-align: center; margin-top: 0; color: #89b4fa; }
-        .upload-area { border: 2px dashed #45475a; border-radius: 8px; padding: 20px; text-align: center; background: #181825; margin-bottom: 20px; cursor: pointer; }
+        .upload-area { border: 2px dashed #45475a; border-radius: 8px; padding: 25px; text-align: center; background: #181825; margin-bottom: 20px; cursor: pointer; }
         .upload-area:hover { border-color: #89b4fa; }
         input[type="file"] { display: none; }
         .btn-upload { padding: 10px 20px; border: none; border-radius: 6px; background: #89b4fa; color: #11111b; font-weight: bold; cursor: pointer; display: inline-block; margin-top: 10px; }
@@ -106,10 +99,10 @@ HTML_CODE = """
 <div class="container">
     <h2>Kho Lưu Trữ File TXT (PostgreSQL)</h2>
 
-    <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-        <p style="margin:0;">Kéo thả hoặc nhấn vào đây để chọn file <strong>.txt</strong></p>
-        <input type="file" id="fileInput" accept=".txt" onchange="uploadFile(this.files)">
-        <button class="btn-upload">Tải file lên</button>
+    <div class="upload-area" id="dropArea">
+        <p style="margin:0;">Kéo thả hoặc nhấn vào nút bên dưới để chọn file <strong>.txt</strong></p>
+        <input type="file" id="fileInput" accept=".txt">
+        <button class="btn-upload" onclick="document.getElementById('fileInput').click()">Tải file lên</button>
     </div>
 
     <div id="file-list"></div>
@@ -126,31 +119,29 @@ HTML_CODE = """
 </div>
 
 <script>
-    // Ép SocketIO dùng HTTP Polling trước để vượt rào cản Cloudflare / Render Proxy
     const socket = io({
         transports: ['polling', 'websocket'],
         upgrade: true
     });
 
     const fileListDiv = document.getElementById('file-list');
+    const fileInput = document.getElementById('fileInput');
 
     socket.on('connect', function() {
         console.log('Đã kết nối SocketIO thành công!');
     });
 
-    socket.on('load_files', function(files) {
+    socket.on('load_files', renderFiles);
+    socket.on('new_file', renderFiles);
+
+    function renderFiles(files) {
         fileListDiv.innerHTML = '';
-        if (files.length === 0) {
+        if (!files || files.length === 0) {
             fileListDiv.innerHTML = '<p style="text-align:center; color:#a6adc8;">Chưa có file nào trong Database.</p>';
         } else {
             files.forEach(file => appendFileUI(file));
         }
-    });
-
-    socket.on('new_file', function(files) {
-        fileListDiv.innerHTML = '';
-        files.forEach(file => appendFileUI(file));
-    });
+    }
 
     function appendFileUI(file) {
         const card = document.createElement('div');
@@ -174,7 +165,8 @@ HTML_CODE = """
         fileListDiv.appendChild(card);
     }
 
-    function uploadFile(files) {
+    fileInput.addEventListener('change', function(e) {
+        const files = e.target.files;
         if (files.length === 0) return;
         const file = files[0];
 
@@ -184,17 +176,17 @@ HTML_CODE = """
         }
 
         const reader = new FileReader();
-        reader.onload = function(e) {
-            const content = e.target.result;
+        reader.onload = function(evt) {
+            const content = evt.target.result;
             socket.emit('upload_txt', {
                 filename: file.name,
                 content: content,
                 filesize: file.size
             });
-            document.getElementById('fileInput').value = '';
+            fileInput.value = '';
         };
         reader.readAsText(file);
-    }
+    });
 
     function openModal(encFilename, encContent) {
         document.getElementById('modalTitle').innerText = decodeURIComponent(encFilename);
@@ -207,6 +199,7 @@ HTML_CODE = """
     }
 
     function escapeHtml(text) {
+        if (!text) return '';
         return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     }
 </script>
@@ -216,7 +209,6 @@ HTML_CODE = """
 """
 
 def get_recent_files():
-    """Hàm lấy danh sách các file gần nhất trong PostgreSQL"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -230,7 +222,7 @@ def get_recent_files():
         conn.close()
         return [dict(row) for row in rows]
     except Exception as e:
-        print(f"Lỗi lấy file: {e}")
+        print(f">>> Lỗi lấy file: {e}")
         return []
 
 @app.route('/')
@@ -239,7 +231,6 @@ def index():
 
 @app.route('/view/<int:file_id>')
 def view_file(file_id):
-    """Xem trực tiếp file dạng text trên tab mới"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -251,12 +242,11 @@ def view_file(file_id):
         if row:
             return row[0], 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
-        print(f"Lỗi view_file: {e}")
+        print(f">>> Lỗi view_file: {e}")
     return "File không tồn tại", 404
 
 @app.route('/download/<int:file_id>')
 def download_file(file_id):
-    """Tải file .txt về máy"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -277,7 +267,7 @@ def download_file(file_id):
                 mimetype='text/plain'
             )
     except Exception as e:
-        print(f"Lỗi download_file: {e}")
+        print(f">>> Lỗi download_file: {e}")
     return "File không tồn tại", 404
 
 @socketio.on('connect')
@@ -295,14 +285,12 @@ def handle_upload(data):
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # 1. Thêm file mới
             cursor.execute(
                 "INSERT INTO txt_files (filename, content, filesize) VALUES (%s, %s, %s)", 
                 (filename, content, filesize)
             )
             conn.commit()
 
-            # 2. Xóa các file cũ vượt quá MAX_FILES
             cursor.execute("""
                 DELETE FROM txt_files 
                 WHERE id NOT IN (
@@ -316,7 +304,7 @@ def handle_upload(data):
 
             emit('new_file', get_recent_files(), broadcast=True)
         except Exception as e:
-            print(f"Lỗi upload: {e}")
+            print(f">>> Lỗi upload: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
