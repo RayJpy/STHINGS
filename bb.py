@@ -8,19 +8,32 @@ from flask_socketio import SocketIO, emit
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
 
+# Cho phép kết nối từ mọi nguồn
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 MAX_FILES = 10  # Số lượng file tối đa muốn lưu trữ
 
-# Lấy URL kết nối PostgreSQL từ biến môi trường (mặc định dùng URI test nếu chưa cài ENV)
+# Lấy DATABASE_URL từ Render/Environment
 DATABASE_URL = os.environ.get(
     'DATABASE_URL', 
     'postgresql://postgres:password@localhost:5432/postgres'
 )
 
 def get_db_connection():
-    """Hàm tạo kết nối tới PostgreSQL Database"""
-    conn = psycopg2.connect(DATABASE_URL)
+    """Hàm tạo kết nối tới PostgreSQL với cấu hình tự sửa lỗi SSL cho Neon.tech"""
+    db_url = DATABASE_URL
+    # Ép prefix postgresql:// nếu Neon trả về postgres://
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    
+    # Bắt buộc bật SSL Mode nếu dùng Neon.tech trên cloud
+    if "sslmode" not in db_url and "localhost" not in db_url:
+        if "?" in db_url:
+            db_url += "&sslmode=require"
+        else:
+            db_url += "?sslmode=require"
+
+    conn = psycopg2.connect(db_url)
     return conn
 
 # 1. KHỞI TẠO CƠ SỞ DỮ LIỆU POSTGRESQL
@@ -113,12 +126,25 @@ HTML_CODE = """
 </div>
 
 <script>
-    const socket = io();
+    // Ép SocketIO dùng HTTP Polling trước để vượt rào cản Cloudflare / Render Proxy
+    const socket = io({
+        transports: ['polling', 'websocket'],
+        upgrade: true
+    });
+
     const fileListDiv = document.getElementById('file-list');
+
+    socket.on('connect', function() {
+        console.log('Đã kết nối SocketIO thành công!');
+    });
 
     socket.on('load_files', function(files) {
         fileListDiv.innerHTML = '';
-        files.forEach(file => appendFileUI(file));
+        if (files.length === 0) {
+            fileListDiv.innerHTML = '<p style="text-align:center; color:#a6adc8;">Chưa có file nào trong Database.</p>';
+        } else {
+            files.forEach(file => appendFileUI(file));
+        }
     });
 
     socket.on('new_file', function(files) {
@@ -214,38 +240,44 @@ def index():
 @app.route('/view/<int:file_id>')
 def view_file(file_id):
     """Xem trực tiếp file dạng text trên tab mới"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT content FROM txt_files WHERE id = %s", (file_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM txt_files WHERE id = %s", (file_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
 
-    if row:
-        return row[0], 200, {'Content-Type': 'text/plain; charset=utf-8'}
+        if row:
+            return row[0], 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        print(f"Lỗi view_file: {e}")
     return "File không tồn tại", 404
 
 @app.route('/download/<int:file_id>')
 def download_file(file_id):
     """Tải file .txt về máy"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
 
-    if row:
-        filename, content = row
-        buffer = io.BytesIO()
-        buffer.write(content.encode('utf-8'))
-        buffer.seek(0)
-        return send_file(
-            buffer,
-            as_attachment=True,
-            download_name=filename,
-            mimetype='text/plain'
-        )
+        if row:
+            filename, content = row
+            buffer = io.BytesIO()
+            buffer.write(content.encode('utf-8'))
+            buffer.seek(0)
+            return send_file(
+                buffer,
+                as_attachment=True,
+                download_name=filename,
+                mimetype='text/plain'
+            )
+    except Exception as e:
+        print(f"Lỗi download_file: {e}")
     return "File không tồn tại", 404
 
 @socketio.on('connect')
@@ -259,29 +291,32 @@ def handle_upload(data):
     filesize = data.get('filesize', 0)
 
     if content.strip():
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
 
-        # 1. Thêm file mới
-        cursor.execute(
-            "INSERT INTO txt_files (filename, content, filesize) VALUES (%s, %s, %s)", 
-            (filename, content, filesize)
-        )
-        conn.commit()
-
-        # 2. Xóa các file cũ vượt quá MAX_FILES
-        cursor.execute("""
-            DELETE FROM txt_files 
-            WHERE id NOT IN (
-                SELECT id FROM txt_files ORDER BY id DESC LIMIT %s
+            # 1. Thêm file mới
+            cursor.execute(
+                "INSERT INTO txt_files (filename, content, filesize) VALUES (%s, %s, %s)", 
+                (filename, content, filesize)
             )
-        """, (MAX_FILES,))
-        conn.commit()
+            conn.commit()
 
-        cursor.close()
-        conn.close()
+            # 2. Xóa các file cũ vượt quá MAX_FILES
+            cursor.execute("""
+                DELETE FROM txt_files 
+                WHERE id NOT IN (
+                    SELECT id FROM txt_files ORDER BY id DESC LIMIT %s
+                )
+            """, (MAX_FILES,))
+            conn.commit()
 
-        emit('new_file', get_recent_files(), broadcast=True)
+            cursor.close()
+            conn.close()
+
+            emit('new_file', get_recent_files(), broadcast=True)
+        except Exception as e:
+            print(f"Lỗi upload: {e}")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
