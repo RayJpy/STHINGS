@@ -1,5 +1,6 @@
-import eventlet
-eventlet.monkey_patch()
+from gevent import monkey
+monkey.patch_all()
+
 import os
 import io
 import psycopg2
@@ -10,8 +11,8 @@ from flask_socketio import SocketIO, emit
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
 
-# Cho phép kết nối SocketIO từ mọi nguồn
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Khởi tạo SocketIO với gevent
+socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins="*")
 
 MAX_FILES = 10  # Số lượng file tối đa lưu trữ trong DB
 
