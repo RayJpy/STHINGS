@@ -1,32 +1,50 @@
-import sqlite3
 import os
 import io
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, send_file
 from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'bi_mat_123456'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
 
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 MAX_FILES = 10  # Số lượng file tối đa muốn lưu trữ
 
-# 1. KHỞI TẠO CƠ SỞ DỮ LIỆU SQLITE
-def init_db():
-    conn = sqlite3.connect('txt_storage.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS txt_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename TEXT NOT NULL,
-            content TEXT NOT NULL,
-            filesize INTEGER NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Lấy URL kết nối PostgreSQL từ biến môi trường (mặc định dùng URI test nếu chưa cài ENV)
+DATABASE_URL = os.environ.get(
+    'DATABASE_URL', 
+    'postgresql://postgres:password@localhost:5432/postgres'
+)
 
+def get_db_connection():
+    """Hàm tạo kết nối tới PostgreSQL Database"""
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
+# 1. KHỞI TẠO CƠ SỞ DỮ LIỆU POSTGRESQL
+def init_db():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS txt_files (
+                id SERIAL PRIMARY KEY,
+                filename VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                filesize INTEGER NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print(">>> Khởi tạo PostgreSQL Database thành công!")
+    except Exception as e:
+        print(f">>> Lỗi kết nối CSDL PostgreSQL: {e}")
+
+# Gọi hàm khởi tạo DB khi app chạy
 init_db()
 
 # 2. GIAO DIỆN HTML + JAVASCRIPT
@@ -62,7 +80,6 @@ HTML_CODE = """
         .btn-download { background: #a6e3a1; color: #11111b; }
         .btn-download:hover { background: #94e2d5; }
         
-        /* Style cho Modal Popup */
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.7); z-index: 1000; justify-content: center; align-items: center; }
         .modal-box { background: #2b2b3b; width: 90%; max-width: 700px; height: 80vh; padding: 20px; border-radius: 12px; display: flex; flex-direction: column; box-shadow: 0 5px 20px rgba(0,0,0,0.5); }
         .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
@@ -74,7 +91,7 @@ HTML_CODE = """
 <body>
 
 <div class="container">
-    <h2>Kho Lưu Trữ File TXT Gần Nhất</h2>
+    <h2>Kho Lưu Trữ File TXT (PostgreSQL)</h2>
 
     <div class="upload-area" onclick="document.getElementById('fileInput').click()">
         <p style="margin:0;">Kéo thả hoặc nhấn vào đây để chọn file <strong>.txt</strong></p>
@@ -85,7 +102,6 @@ HTML_CODE = """
     <div id="file-list"></div>
 </div>
 
-<!-- Modal Popup Xem Nhanh -->
 <div id="viewModal" class="modal-overlay">
     <div class="modal-box">
         <div class="modal-header">
@@ -114,7 +130,6 @@ HTML_CODE = """
         const card = document.createElement('div');
         card.className = 'file-card';
         
-        // Encode an toàn dữ liệu để truyền vào hàm onclick JavaScript
         const encodedContent = encodeURIComponent(file.content);
         const encodedFilename = encodeURIComponent(file.filename);
 
@@ -175,20 +190,22 @@ HTML_CODE = """
 """
 
 def get_recent_files():
-    """Hàm lấy các file mới nhất trong DB (Tối đa MAX_FILES)"""
-    conn = sqlite3.connect('txt_storage.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, filename, content, filesize, timestamp FROM txt_files ORDER BY id DESC LIMIT ?", (MAX_FILES,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    return [{
-        'id': row[0],
-        'filename': row[1],
-        'content': row[2],
-        'filesize': row[3],
-        'timestamp': row[4]
-    } for row in rows]
+    """Hàm lấy danh sách các file gần nhất trong PostgreSQL"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(
+            "SELECT id, filename, content, filesize, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp "
+            "FROM txt_files ORDER BY id DESC LIMIT %s", 
+            (MAX_FILES,)
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"Lỗi lấy file: {e}")
+        return []
 
 @app.route('/')
 def index():
@@ -196,11 +213,12 @@ def index():
 
 @app.route('/view/<int:file_id>')
 def view_file(file_id):
-    """API xem trực tiếp toàn bộ nội dung file dạng văn bản trên tab trình duyệt mới"""
-    conn = sqlite3.connect('txt_storage.db')
+    """Xem trực tiếp file dạng text trên tab mới"""
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT content FROM txt_files WHERE id = ?", (file_id,))
+    cursor.execute("SELECT content FROM txt_files WHERE id = %s", (file_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
 
     if row:
@@ -209,11 +227,12 @@ def view_file(file_id):
 
 @app.route('/download/<int:file_id>')
 def download_file(file_id):
-    """API hỗ trợ tải file về máy"""
-    conn = sqlite3.connect('txt_storage.db')
+    """Tải file .txt về máy"""
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT filename, content FROM txt_files WHERE id = ?", (file_id,))
+    cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
 
     if row:
@@ -240,20 +259,26 @@ def handle_upload(data):
     filesize = data.get('filesize', 0)
 
     if content.strip():
-        conn = sqlite3.connect('txt_storage.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
 
-        cursor.execute("INSERT INTO txt_files (filename, content, filesize) VALUES (?, ?, ?)", 
-                       (filename, content, filesize))
+        # 1. Thêm file mới
+        cursor.execute(
+            "INSERT INTO txt_files (filename, content, filesize) VALUES (%s, %s, %s)", 
+            (filename, content, filesize)
+        )
         conn.commit()
 
+        # 2. Xóa các file cũ vượt quá MAX_FILES
         cursor.execute("""
             DELETE FROM txt_files 
             WHERE id NOT IN (
-                SELECT id FROM txt_files ORDER BY id DESC LIMIT ?
+                SELECT id FROM txt_files ORDER BY id DESC LIMIT %s
             )
         """, (MAX_FILES,))
         conn.commit()
+
+        cursor.close()
         conn.close()
 
         emit('new_file', get_recent_files(), broadcast=True)
@@ -261,4 +286,3 @@ def handle_upload(data):
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     socketio.run(app, host='0.0.0.0', port=port, debug=True)
-    
