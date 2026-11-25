@@ -111,25 +111,21 @@ def get_recent_files():
         cursor.execute(
             "SELECT id, filename, content, filesize, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp "
             "FROM txt_files ORDER BY id DESC LIMIT %s",
-            (MAX_FILES,)
-        )
+            (MAX_FILES))
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
-
         result = []
         for row in rows:
             item = dict(row)
             raw = bytes(item['content']) if item['content'] is not None else b""
             item['preview'] = raw.decode('utf-8', errors='replace')[:2000]
-            item['content_b64'] = base64.b64encode(raw).decode('ascii')
             del item['content']
             result.append(item)
         return result
     except Exception as e:
         print("[get_recent_files error]:", repr(e), flush=True)
         return []
-
 
 HTML_CODE = """
 <!DOCTYPE html>
