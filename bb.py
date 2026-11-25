@@ -11,7 +11,7 @@ from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
-app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '25')) * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '35')) * 1024 * 1024
 
 UPLOAD_ROUTE = os.environ.get('UPLOAD_PATH', '/upload/wda')
 if not UPLOAD_ROUTE.startswith('/'):
