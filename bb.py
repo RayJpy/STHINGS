@@ -17,7 +17,12 @@ UPLOAD_ROUTE = os.environ.get('UPLOAD_PATH', '/upload/wda')
 if not UPLOAD_ROUTE.startswith('/'):
     UPLOAD_ROUTE = '/' + UPLOAD_ROUTE
 
-socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins="*", max_http_buffer_size=60 * 1024 * 1024)
+socketio = SocketIO(
+    app,
+    async_mode='gevent',
+    cors_allowed_origins="*",
+    max_http_buffer_size=60 * 1024 * 1024
+)
 
 MAX_FILES = 13
 
@@ -57,8 +62,12 @@ def init_db():
         if col and col[0] in ('text', 'character varying'):
             cursor.execute('''
                 ALTER TABLE txt_files
-                ALTER COLUMN content TYPE BYTEA USING content::bytea
+                ALTER COLUMN content TYPE BYTEA USING convert_to(content, 'UTF8')
             ''')
+        cursor.execute('''
+            ALTER TABLE txt_files
+            ALTER COLUMN filesize TYPE BIGINT
+        ''')
         conn.commit()
         cursor.close()
         conn.close()
@@ -82,20 +91,22 @@ def save_binary_file(filename: str, raw_bytes: bytes, filesize: int | None = Non
     if not raw_bytes:
         raise ValueError("File rỗng!")
 
-    actual_size = filesize if filesize is not None else len(raw_bytes)
+    actual_size = int(filesize) if filesize is not None else len(raw_bytes)
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
     cursor.execute(
         "INSERT INTO txt_files (filename, content, filesize) VALUES (%s, %s, %s)",
-        (clean_name, psycopg2.Binary(raw_bytes), actual_size))
+        (clean_name, psycopg2.Binary(raw_bytes), actual_size)
+    )
     conn.commit()
 
     cursor.execute("""
         DELETE FROM txt_files
         WHERE id NOT IN (
-            SELECT id FROM txt_files ORDER BY id DESC LIMIT %s)
+            SELECT id FROM txt_files ORDER BY id DESC LIMIT %s
+        )
     """, (MAX_FILES,))
     conn.commit()
 
@@ -109,23 +120,27 @@ def get_recent_files():
         conn = get_db_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute(
-            "SELECT id, filename, content, filesize, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp "
+            "SELECT id, filename, filesize, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') as timestamp, "
+            "SUBSTRING(content FROM 1 FOR 4000) as preview_bytes "
             "FROM txt_files ORDER BY id DESC LIMIT %s",
-            (MAX_FILES))
+            (MAX_FILES,)
+        )
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
+
         result = []
         for row in rows:
             item = dict(row)
-            raw = bytes(item['content']) if item['content'] is not None else b""
-            item['preview'] = raw.decode('utf-8', errors='replace')[:2000]
-            del item['content']
+            raw_head = bytes(item.get('preview_bytes') or b"")
+            item['preview'] = raw_head.decode('utf-8', errors='replace')[:2000]
+            item.pop('preview_bytes', None)
             result.append(item)
         return result
     except Exception as e:
         print("[get_recent_files error]:", repr(e), flush=True)
         return []
+
 
 HTML_CODE = """
 <!DOCTYPE html>
@@ -178,15 +193,33 @@ HTML_CODE = """
 </div>
 
 <script>
+    const fileListDiv = document.getElementById('file-list');
+
+    async function refreshFilesFromApi() {
+        try {
+            const res = await fetch('/api/files', { cache: 'no-store' });
+            if (res.ok) {
+                const files = await res.json();
+                renderFiles(files);
+            }
+        } catch (_) {}
+    }
+
+    refreshFilesFromApi();
+
     const socket = io({
         transports: ['polling', 'websocket'],
         upgrade: true
     });
 
-    const fileListDiv = document.getElementById('file-list');
-
     socket.on('load_files', renderFiles);
-    socket.on('new_file', renderFiles);
+    socket.on('new_file', function(files) {
+        if (Array.isArray(files)) {
+            renderFiles(files);
+        } else {
+            refreshFilesFromApi();
+        }
+    });
     socket.on('error_msg', function(data) {
         alert('Lỗi Server DB: ' + data.error);
     });
@@ -365,6 +398,11 @@ def index():
     return render_template_string(HTML_CODE)
 
 
+@app.route('/api/files')
+def api_files():
+    return jsonify(get_recent_files())
+
+
 @app.route(UPLOAD_ROUTE, methods=['GET', 'POST'])
 def handle_upload_route():
     if request.method == 'GET':
@@ -397,72 +435,3 @@ def handle_upload_route():
 @app.route('/view/<int:file_id>')
 def view_file(file_id):
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
-        if row:
-            filename, raw = row
-            raw_bytes = bytes(raw)
-            if filename.lower().endswith('.exe') or b'\x00' in raw_bytes[:1024]:
-                return send_file(
-                    io.BytesIO(raw_bytes),
-                    as_attachment=False,
-                    download_name=filename,
-                    mimetype='application/octet-stream'
-                )
-            return raw_bytes.decode('utf-8', errors='replace'), 200, {'Content-Type': 'text/plain; charset=utf-8'}
-    except Exception as e:
-        print("[view_file error]:", repr(e), flush=True)
-    return "File không tồn tại", 404
-
-
-@app.route('/download/<int:file_id>')
-def download_file(file_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        conn.close()
-
-        if row:
-            filename, raw = row
-            return send_file(
-                io.BytesIO(bytes(raw)),
-                as_attachment=True,
-                download_name=filename,
-                mimetype='application/octet-stream')
-    except Exception as e:
-        print("[download_file error]:", repr(e), flush=True)
-    return "File không tồn tại", 404
-
-
-@socketio.on('connect')
-def handle_connect():
-    emit('load_files', get_recent_files())
-
-
-@socketio.on('upload_file')
-def handle_upload_socket(data):
-    filename = data.get('filename', 'file_khong_ten')
-    filesize = data.get('filesize')
-    try:
-        if 'content_b64' in data:
-            raw = base64.b64decode(data['content_b64'])
-        else:
-            raw = (data.get('content') or '').encode('utf-8')
-        files = save_binary_file(filename, raw, filesize)
-        emit('new_file', files, broadcast=True)
-    except Exception as e:
-        print("[socket upload error]:", repr(e), flush=True)
-        emit('error_msg', {'error': str(e)})
-
-
-while True:
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host='0.0.0.0', port=port, debug=True)
