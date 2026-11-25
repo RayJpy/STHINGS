@@ -3,6 +3,7 @@ monkey.patch_all()
 
 import os
 import io
+import base64
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template_string, send_file, request, jsonify
@@ -10,6 +11,11 @@ from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '25')) * 1024 * 1024
+
+UPLOAD_ROUTE = os.environ.get('UPLOAD_PATH', '/upload/wda')
+if not UPLOAD_ROUTE.startswith('/'):
+    UPLOAD_ROUTE = '/' + UPLOAD_ROUTE
 
 socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins="*")
 
@@ -18,18 +24,15 @@ MAX_FILES = 13
 
 def get_db_connection():
     db_url = os.environ.get('DATABASE_URL')
-
     if not db_url:
-        raise ValueError("Chưa cấu hình biến môi trường DATABASE_URL trên Render Environment!")
+        raise ValueError("Chưa cấu hình biến môi trường DATABASE_URL!")
 
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
 
     if "sslmode" not in db_url and "localhost" not in db_url:
-        if "?" in db_url:
-            db_url += "&sslmode=require"
-        else:
-            db_url += "?sslmode=require"
+        sep = "&" if "?" in db_url else "?"
+        db_url += f"{sep}sslmode=require"
 
     return psycopg2.connect(db_url)
 
@@ -42,15 +45,23 @@ def init_db():
             CREATE TABLE IF NOT EXISTS txt_files (
                 id SERIAL PRIMARY KEY,
                 filename VARCHAR(255) NOT NULL,
-                content TEXT NOT NULL,
+                content BYTEA NOT NULL,
                 filesize INTEGER NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
         ''')
+        cursor.execute('''
+            SELECT data_type FROM information_schema.columns
+            WHERE table_name = 'txt_files' AND column_name = 'content'
+        ''')
+        col = cursor.fetchone()
+        if col and col[0] in ('text', 'character varying'):
+            cursor.execute('''
+                ALTER TABLE txt_files
+                ALTER COLUMN content TYPE BYTEA USING content::bytea
+            ''')
         conn.commit()
         cursor.close()
         conn.close()
-        print(">>> [SUCCESS] Khởi tạo PostgreSQL Database thành công!")
     except Exception as e:
         pass
 
@@ -58,39 +69,38 @@ def init_db():
 init_db()
 
 
-def save_txt_file(filename: str, content: str, filesize: int | None = None):
-    """Lưu file .txt vào DB, giữ tối đa MAX_FILES và trả về danh sách file mới nhất."""
-    clean_name = (filename or "untitled.txt").strip()
-    if not clean_name.lower().endswith(".txt"):
-        clean_name += ".txt"
+@app.after_request
+def add_quick_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
-    if not content or not content.strip():
-        raise ValueError("Nội dung file trống!")
 
-    actual_size = filesize if filesize is not None else len(content.encode("utf-8"))
+def save_binary_file(filename: str, raw_bytes: bytes, filesize: int | None = None):
+    clean_name = os.path.basename((filename or "file_khong_ten").strip()) or "file_khong_ten"
+    if not raw_bytes:
+        raise ValueError("File rỗng!")
+
+    actual_size = filesize if filesize is not None else len(raw_bytes)
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # 1. Chèn file mới
     cursor.execute(
         "INSERT INTO txt_files (filename, content, filesize) VALUES (%s, %s, %s)",
-        (clean_name, content, actual_size)
-    )
+        (clean_name, psycopg2.Binary(raw_bytes), actual_size))
     conn.commit()
 
-    # 2. Xóa bớt file cũ quá giới hạn MAX_FILES
     cursor.execute("""
         DELETE FROM txt_files
         WHERE id NOT IN (
-            SELECT id FROM txt_files ORDER BY id DESC LIMIT %s
-        )
+            SELECT id FROM txt_files ORDER BY id DESC LIMIT %s)
     """, (MAX_FILES,))
     conn.commit()
 
     cursor.close()
     conn.close()
-
     return get_recent_files()
 
 
@@ -106,33 +116,34 @@ def get_recent_files():
         rows = cursor.fetchall()
         cursor.close()
         conn.close()
-        return [dict(row) for row in rows]
+
+        result = []
+        for row in rows:
+            item = dict(row)
+            raw = bytes(item['content']) if item['content'] is not None else b""
+            item['preview'] = raw.decode('utf-8', errors='replace')[:2000]
+            item['content_b64'] = base64.b64encode(raw).decode('ascii')
+            del item['content']
+            result.append(item)
+        return result
     except Exception as e:
         pass
         return []
 
 
-# 2. GIAO DIỆN TRANG CHÍNH
 HTML_CODE = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Kho Lưu Trữ File TXT</title>
+    <meta name="robots" content="noindex, nofollow">
+    <title>Kho Lưu Trữ File</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { width: 100%; max-width: 750px; background: #2b2b3b; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); }
-        .top-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
-        h2 { margin: 0; color: #89b4fa; }
-        .quick-link { background: #313244; color: #f9e2af; text-decoration: none; padding: 8px 12px; border-radius: 6px; font-size: 0.85em; border: 1px solid #45475a; }
-        .quick-link:hover { border-color: #f9e2af; }
-        .upload-area { border: 2px dashed #45475a; border-radius: 8px; padding: 25px; text-align: center; background: #181825; margin-bottom: 20px; cursor: pointer; }
-        .upload-area:hover { border-color: #89b4fa; }
-        input[type="file"] { display: none; }
-        .btn-upload { padding: 10px 20px; border: none; border-radius: 6px; background: #89b4fa; color: #11111b; font-weight: bold; cursor: pointer; display: inline-block; margin-top: 10px; }
-        .btn-upload:hover { background: #b4befe; }
+        h2 { text-align: center; margin-top: 0; color: #89b4fa; }
         #file-list { display: flex; flex-direction: column; gap: 12px; }
         .file-card { background: #313244; border-radius: 8px; padding: 15px; border-left: 4px solid #89b4fa; }
         .file-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; gap: 10px; }
@@ -142,11 +153,8 @@ HTML_CODE = """
         .action-btns { display: flex; gap: 8px; flex-wrap: wrap; }
         .btn { padding: 6px 12px; border: none; border-radius: 4px; font-weight: bold; text-decoration: none; cursor: pointer; font-size: 0.85em; display: inline-block; }
         .btn-view { background: #89b4fa; color: #11111b; }
-        .btn-view:hover { background: #b4befe; }
         .btn-modal { background: #f9e2af; color: #11111b; }
-        .btn-modal:hover { background: #fae3b0; }
         .btn-download { background: #a6e3a1; color: #11111b; }
-        .btn-download:hover { background: #94e2d5; }
 
         .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0, 0, 0, 0.7); z-index: 1000; justify-content: center; align-items: center; }
         .modal-box { background: #2b2b3b; width: 90%; max-width: 700px; height: 80vh; padding: 20px; border-radius: 12px; display: flex; flex-direction: column; box-shadow: 0 5px 20px rgba(0,0,0,0.5); }
@@ -159,17 +167,7 @@ HTML_CODE = """
 <body>
 
 <div class="container">
-    <div class="top-bar">
-        <h2>Kho Lưu Trữ File TXT (PostgreSQL)</h2>
-        <a href="/upload/wda" class="quick-link">Link upload nhanh: /upload/wda</a>
-    </div>
-
-    <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-        <p style="margin:0;">Kéo thả hoặc nhấn vào đây để chọn file <strong>.txt</strong></p>
-        <input type="file" id="fileInput" accept=".txt">
-        <button class="btn-upload" type="button">Tải file lên</button>
-    </div>
-
+    <h2>Kho Lưu Trữ File</h2>
     <div id="file-list"></div>
 </div>
 
@@ -190,15 +188,9 @@ HTML_CODE = """
     });
 
     const fileListDiv = document.getElementById('file-list');
-    const fileInput = document.getElementById('fileInput');
-
-    socket.on('connect', function() {
-        console.log('Đã kết nối SocketIO thành công!');
-    });
 
     socket.on('load_files', renderFiles);
     socket.on('new_file', renderFiles);
-
     socket.on('error_msg', function(data) {
         alert('Lỗi Server DB: ' + data.error);
     });
@@ -216,51 +208,24 @@ HTML_CODE = """
         const card = document.createElement('div');
         card.className = 'file-card';
 
-        const encodedContent = encodeURIComponent(file.content);
-        const encodedFilename = encodeURIComponent(file.filename);
-
         card.innerHTML = `
             <div class="file-header">
-                <span class="file-name">📄 ${escapeHtml(file.filename)}</span>
+                <span class="file-name">${escapeHtml(file.filename)}</span>
                 <span class="file-meta">${file.filesize} bytes | ${file.timestamp}</span>
             </div>
-            <div class="file-preview">${escapeHtml(file.content)}</div>
+            <div class="file-preview">${escapeHtml(file.preview || '')}</div>
             <div class="action-btns">
-                <button type="button" class="btn btn-modal" data-filename="${encodedFilename}" data-content="${encodedContent}" onclick="openModalFromBtn(this)">Xem nhanh</button>
+                <button type="button" class="btn btn-modal" data-filename="${encodeURIComponent(file.filename)}" data-preview="${encodeURIComponent(file.preview || '')}" onclick="openModalFromBtn(this)">Xem nhanh</button>
                 <a href="/view/${file.id}" target="_blank" class="btn btn-view">Mở Tab mới</a>
-                <a href="/download/${file.id}" class="btn btn-download">Tải về (.txt)</a>
+                <a href="/download/${file.id}" class="btn btn-download">Tải về</a>
             </div>
         `;
         fileListDiv.appendChild(card);
     }
 
-    fileInput.addEventListener('change', function(e) {
-        const files = e.target.files;
-        if (files.length === 0) return;
-        const file = files[0];
-
-        if (!file.name.toLowerCase().endsWith('.txt')) {
-            alert('Chỉ hỗ trợ lưu trữ file .txt!');
-            return;
-        }
-
-        const reader = new FileReader();
-        reader.onload = function(evt) {
-            socket.emit('upload_txt', {
-                filename: file.name,
-                content: evt.target.result,
-                filesize: file.size
-            });
-            fileInput.value = '';
-        };
-        reader.readAsText(file);
-    });
-
     function openModalFromBtn(btn) {
-        const encFilename = btn.getAttribute('data-filename') || '';
-        const encContent = btn.getAttribute('data-content') || '';
-        document.getElementById('modalTitle').innerText = decodeURIComponent(encFilename);
-        document.getElementById('modalContent').value = decodeURIComponent(encContent);
+        document.getElementById('modalTitle').innerText = decodeURIComponent(btn.getAttribute('data-filename') || '');
+        document.getElementById('modalContent').value = decodeURIComponent(btn.getAttribute('data-preview') || '');
         document.getElementById('viewModal').style.display = 'flex';
     }
 
@@ -283,14 +248,14 @@ HTML_CODE = """
 </html>
 """
 
-# 3. GIAO DIỆN CHUYÊN DỤNG CHO /upload/wda
-UPLOAD_WDA_HTML = """
+UPLOAD_PAGE_HTML = """
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Upload File TXT - WDA</title>
+    <meta name="robots" content="noindex, nofollow">
+    <title>Upload File</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; box-sizing: border-box; }
@@ -306,26 +271,25 @@ UPLOAD_WDA_HTML = """
         .status { margin-top: 14px; padding: 10px 12px; border-radius: 6px; font-size: 0.9em; display: none; white-space: pre-wrap; }
         .status.ok { display: block; background: rgba(166, 227, 161, 0.15); color: #a6e3a1; border: 1px solid #a6e3a1; }
         .status.err { display: block; background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid #f38ba8; }
-        .footer-links { margin-top: 18px; display: flex; justify-content: space-between; font-size: 0.9em; }
+        .footer-links { margin-top: 18px; font-size: 0.9em; }
         .footer-links a { color: #89b4fa; text-decoration: none; }
-        .footer-links a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
 <div class="box">
-    <h2>Upload File (.txt) — /upload/wda</h2>
-    <div class="sub">Chọn hoặc kéo thả file <strong>.txt</strong> để đẩy thẳng vào Database và cập nhật real-time.</div>
+    <h2>Upload File</h2>
+    <div class="sub">Hỗ trợ mọi loại file (kể cả <strong>.exe</strong> hoặc file không có định dạng).</div>
 
-    <div id="dropzone" class="dropzone" onclick="document.getElementById('wdaFileInput').click()">
-        <div id="chosenName">Nhấn để chọn file <strong>.txt</strong> hoặc kéo thả vào đây</div>
-        <input type="file" id="wdaFileInput" accept=".txt">
+    <div id="dropzone" class="dropzone" onclick="document.getElementById('fileInput').click()">
+        <div id="chosenName">Nhấn để chọn file hoặc kéo thả vào đây</div>
+        <input type="file" id="fileInput">
     </div>
 
     <button id="submitBtn" class="btn btn-primary" type="button">Gửi file lên</button>
     <div id="statusBox" class="status"></div>
 
     <div class="footer-links">
-        <a href="/">← Về trang danh sách file</a>
+        <a href="/">← Danh sách file</a>
     </div>
 </div>
 
@@ -336,7 +300,7 @@ UPLOAD_WDA_HTML = """
     });
 
     const dropzone = document.getElementById('dropzone');
-    const fileInput = document.getElementById('wdaFileInput');
+    const fileInput = document.getElementById('fileInput');
     const chosenName = document.getElementById('chosenName');
     const submitBtn = document.getElementById('submitBtn');
     const statusBox = document.getElementById('statusBox');
@@ -349,77 +313,70 @@ UPLOAD_WDA_HTML = """
 
     function setFile(file) {
         if (!file) return;
-        if (!file.name.toLowerCase().endsWith('.txt')) {
-            selectedFile = null;
-            chosenName.innerHTML = 'Nhấn để chọn file <strong>.txt</strong> hoặc kéo thả vào đây';
-            showStatus('Chỉ hỗ trợ file định dạng .txt!', true);
-            return;
-        }
         selectedFile = file;
-        chosenName.innerHTML = `Đã chọn: <strong>${file.name}</strong> (${file.size} bytes)`;
+        chosenName.textContent = `Đã chọn: ${file.name} (${file.size} bytes)`;
         statusBox.className = 'status';
     }
 
     fileInput.addEventListener('change', (e) => setFile(e.target.files[0]));
-
-    dropzone.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        dropzone.classList.add('dragover');
-    });
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
     dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
     dropzone.addEventListener('drop', (e) => {
         e.preventDefault();
         dropzone.classList.remove('dragover');
-        if (e.dataTransfer.files.length > 0) {
-            setFile(e.dataTransfer.files[0]);
-        }
+        if (e.dataTransfer.files.length > 0) setFile(e.dataTransfer.files[0]);
     });
+
+    function arrayBufferToBase64(buffer) {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        return btoa(binary);
+    }
 
     submitBtn.addEventListener('click', () => {
         if (!selectedFile) {
-            showStatus('Vui lòng chọn một file .txt trước khi gửi!', true);
+            showStatus('Chưa chọn file!', true);
             return;
         }
         const reader = new FileReader();
         reader.onload = (evt) => {
             const payload = {
                 filename: selectedFile.name,
-                content: evt.target.result,
+                content_b64: arrayBufferToBase64(evt.target.result),
                 filesize: selectedFile.size
             };
             if (socket.connected) {
-                socket.emit('upload_txt', payload);
-                showStatus(`Đã gửi "${selectedFile.name}" thành công!`);
+                socket.emit('upload_file', payload);
+                showStatus(`Đã gửi "${selectedFile.name}"`);
                 selectedFile = null;
                 fileInput.value = '';
-                chosenName.innerHTML = 'Nhấn để chọn file <strong>.txt</strong> hoặc kéo thả vào đây';
+                chosenName.textContent = 'Nhấn để chọn file hoặc kéo thả vào đây';
             } else {
-                // Fallback qua HTTP POST nếu socket chưa kịp kết nối
-                fetch('/upload/wda', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                })
-                .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-                .then(({ ok, data }) => {
-                    if (ok) {
-                        showStatus(`Đã upload "${data.filename}" thành công!`);
-                        selectedFile = null;
-                        fileInput.value = '';
-                        chosenName.innerHTML = 'Nhấn để chọn file <strong>.txt</strong> hoặc kéo thả vào đây';
-                    } else {
-                        showStatus(data.error || 'Upload thất bại!', true);
-                    }
-                })
-                .catch(err => showStatus('Lỗi kết nối: ' + err.message, true));
+                const formData = new FormData();
+                formData.append('file', selectedFile);
+                fetch(window.location.pathname, { method: 'POST', body: formData })
+                    .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+                    .then(({ ok, data }) => {
+                        if (ok) {
+                            showStatus(`Đã upload "${data.filename}"`);
+                            selectedFile = null;
+                            fileInput.value = '';
+                            chosenName.textContent = 'Nhấn để chọn file hoặc kéo thả vào đây';
+                        } else {
+                            showStatus(data.error || 'Lỗi upload', true);
+                        }
+                    })
+                    .catch(err => showStatus('Lỗi kết nối: ' + err.message, true));
             }
         };
-        reader.readAsText(selectedFile);
+        reader.readAsArrayBuffer(selectedFile);
     });
 
-    socket.on('error_msg', (data) => {
-        showStatus('Lỗi Server DB: ' + data.error, true);
-    });
+    socket.on('error_msg', (data) => showStatus('Lỗi DB: ' + data.error, true));
 </script>
 </body>
 </html>
@@ -431,37 +388,30 @@ def index():
     return render_template_string(HTML_CODE)
 
 
-@app.route('/upload/wda', methods=['GET', 'POST'])
-def upload_wda():
+@app.route(UPLOAD_ROUTE, methods=['GET', 'POST'])
+def handle_upload_route():
     if request.method == 'GET':
-        return render_template_string(UPLOAD_WDA_HTML)
+        return render_template_string(UPLOAD_PAGE_HTML)
 
     try:
-        if request.is_json:
-            data = request.get_json(silent=True) or {}
-            filename = data.get('filename', 'untitled.txt')
-            content = data.get('content', '')
-            filesize = data.get('filesize')
-        elif 'file' in request.files:
+        if 'file' in request.files:
             f = request.files['file']
             if not f or not f.filename:
                 return jsonify({"error": "Chưa chọn file"}), 400
-            if not f.filename.lower().endswith('.txt'):
-                return jsonify({"error": "Chỉ hỗ trợ file .txt"}), 400
             raw = f.read()
-            filename = f.filename
-            content = raw.decode('utf-8', errors='replace')
-            filesize = len(raw)
-        else:
-            filename = request.form.get('filename', 'untitled.txt')
-            content = request.form.get('content', '')
-            filesize = None
+            files = save_binary_file(f.filename, raw, len(raw))
+            socketio.emit('new_file', files)
+            return jsonify({"message": "OK", "filename": f.filename}), 201
 
-        files = save_txt_file(filename, content, filesize)
+        data = request.get_json(silent=True) or {}
+        filename = data.get('filename', 'file_khong_ten')
+        if 'content_b64' in data:
+            raw = base64.b64decode(data['content_b64'])
+        else:
+            raw = (data.get('content') or '').encode('utf-8')
+        files = save_binary_file(filename, raw, data.get('filesize'))
         socketio.emit('new_file', files)
-        return jsonify({"message": "Upload thành công", "filename": filename}), 201
-    except ValueError as ve:
-        pass
+        return jsonify({"message": "OK", "filename": filename}), 201
     except Exception as e:
         pass
 
@@ -471,15 +421,25 @@ def view_file(file_id):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT content FROM txt_files WHERE id = %s", (file_id,))
+        cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
         row = cursor.fetchone()
         cursor.close()
         conn.close()
 
         if row:
-            return row[0], 200, {'Content-Type': 'text/plain; charset=utf-8'}
+            filename, raw = row
+            raw_bytes = bytes(raw)
+            if filename.lower().endswith('.exe') or b'\x00' in raw_bytes[:1024]:
+                return send_file(
+                    io.BytesIO(raw_bytes),
+                    as_attachment=False,
+                    download_name=filename,
+                    mimetype='application/octet-stream'
+                )
+            return raw_bytes.decode('utf-8', errors='replace'), 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
         pass
+    return "File không tồn tại", 404
 
 
 @app.route('/download/<int:file_id>')
@@ -493,18 +453,14 @@ def download_file(file_id):
         conn.close()
 
         if row:
-            filename, content = row
-            buffer = io.BytesIO()
-            buffer.write(content.encode('utf-8'))
-            buffer.seek(0)
+            filename, raw = row
             return send_file(
-                buffer,
+                io.BytesIO(bytes(raw)),
                 as_attachment=True,
                 download_name=filename,
-                mimetype='text/plain'
-            )
+                mimetype='application/octet-stream')
     except Exception as e:
-        print(f">>> Lỗi download_file: {e}")
+        pass
     return "File không tồn tại", 404
 
 
@@ -513,19 +469,19 @@ def handle_connect():
     emit('load_files', get_recent_files())
 
 
-@socketio.on('upload_txt')
-def handle_upload(data):
-    filename = data.get('filename', 'untitled.txt')
-    content = data.get('content', '')
+@socketio.on('upload_file')
+def handle_upload_socket(data):
+    filename = data.get('filename', 'file_khong_ten')
     filesize = data.get('filesize')
-
-    if content and content.strip():
-        try:
-            files = save_txt_file(filename, content, filesize)
-            emit('new_file', files, broadcast=True)
-        except Exception as e:
-            pass
-
+    try:
+        if 'content_b64' in data:
+            raw = base64.b64decode(data['content_b64'])
+        else:
+            raw = (data.get('content') or '').encode('utf-8')
+        files = save_binary_file(filename, raw, filesize)
+        emit('new_file', files, broadcast=True)
+    except Exception as e:
+        pass
 
 while True:
     port = int(os.environ.get("PORT", 5000))
