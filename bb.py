@@ -170,10 +170,6 @@ UPLOAD_PAGE_HTML = """
 
     <button id="submitBtn" class="btn btn-primary" type="button">Gửi file lên</button>
     <div id="statusBox" class="status"></div>
-
-    <div class="footer-links">
-        <a href="/uploaded/">Xem &amp; tải file tại /uploaded/ →</a>
-    </div>
 </div>
 
 <script>
