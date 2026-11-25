@@ -435,3 +435,73 @@ def handle_upload_route():
 @app.route('/view/<int:file_id>')
 def view_file(file_id):
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if row:
+            filename, raw = row
+            raw_bytes = bytes(raw)
+            if filename.lower().endswith('.exe') or b'\x00' in raw_bytes[:1024]:
+                return send_file(
+                    io.BytesIO(raw_bytes),
+                    as_attachment=False,
+                    download_name=filename,
+                    mimetype='application/octet-stream'
+                )
+            return raw_bytes.decode('utf-8', errors='replace'), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+    except Exception as e:
+        print("[view_file error]:", repr(e), flush=True)
+    return "File không tồn tại", 404
+
+
+@app.route('/download/<int:file_id>')
+def download_file(file_id):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT filename, content FROM txt_files WHERE id = %s", (file_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if row:
+            filename, raw = row
+            return send_file(
+                io.BytesIO(bytes(raw)),
+                as_attachment=True,
+                download_name=filename,
+                mimetype='application/octet-stream'
+            )
+    except Exception as e:
+        print("[download_file error]:", repr(e), flush=True)
+    return "File không tồn tại", 404
+
+
+@socketio.on('connect')
+def handle_connect():
+    emit('load_files', get_recent_files())
+
+
+@socketio.on('upload_file')
+def handle_upload_socket(data):
+    filename = data.get('filename', 'file_khong_ten')
+    filesize = data.get('filesize')
+    try:
+        if 'content_b64' in data:
+            raw = base64.b64decode(data['content_b64'])
+        else:
+            raw = (data.get('content') or '').encode('utf-8')
+        files = save_binary_file(filename, raw, filesize)
+        emit('new_file', files, broadcast=True)
+    except Exception as e:
+        print("[socket upload error]:", repr(e), flush=True)
+        emit('error_msg', {'error': str(e)})
+
+
+while True:
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host='0.0.0.0', port=port, debug=True)
