@@ -11,13 +11,13 @@ from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'bi_mat_123456')
-app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '35')) * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = int(os.environ.get('MAX_UPLOAD_MB', '50')) * 1024 * 1024
 
 UPLOAD_ROUTE = os.environ.get('UPLOAD_PATH', '/upload/wda')
 if not UPLOAD_ROUTE.startswith('/'):
     UPLOAD_ROUTE = '/' + UPLOAD_ROUTE
 
-socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins="*")
+socketio = SocketIO(app, async_mode='gevent', cors_allowed_origins="*", max_http_buffer_size=60 * 1024 * 1024)
 
 MAX_FILES = 13
 
@@ -46,7 +46,7 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 filename VARCHAR(255) NOT NULL,
                 content BYTEA NOT NULL,
-                filesize INTEGER NOT NULL,
+                filesize BIGINT NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
         ''')
         cursor.execute('''
@@ -63,7 +63,7 @@ def init_db():
         cursor.close()
         conn.close()
     except Exception as e:
-        pass
+        print("[init_db error]:", repr(e), flush=True)
 
 
 init_db()
@@ -127,7 +127,7 @@ def get_recent_files():
             result.append(item)
         return result
     except Exception as e:
-        pass
+        print("[get_recent_files error]:", repr(e), flush=True)
         return []
 
 
@@ -256,7 +256,6 @@ UPLOAD_PAGE_HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow">
     <title>Upload File</title>
-    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #cdd6f4; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 100vh; box-sizing: border-box; }
         .box { width: 100%; max-width: 520px; background: #2b2b3b; padding: 28px; border-radius: 12px; box-shadow: 0 4px 18px rgba(0,0,0,0.45); }
@@ -268,7 +267,8 @@ UPLOAD_PAGE_HTML = """
         .btn { width: 100%; padding: 11px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 0.95em; }
         .btn-primary { background: #a6e3a1; color: #11111b; }
         .btn-primary:hover { background: #94e2d5; }
-        .status { margin-top: 14px; padding: 10px 12px; border-radius: 6px; font-size: 0.9em; display: none; white-space: pre-wrap; }
+        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+        .status { margin-top: 14px; padding: 10px 12px; border-radius: 6px; font-size: 0.9em; display: none; white-space: pre-wrap; word-break: break-word; }
         .status.ok { display: block; background: rgba(166, 227, 161, 0.15); color: #a6e3a1; border: 1px solid #a6e3a1; }
         .status.err { display: block; background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid #f38ba8; }
         .footer-links { margin-top: 18px; font-size: 0.9em; }
@@ -294,11 +294,6 @@ UPLOAD_PAGE_HTML = """
 </div>
 
 <script>
-    const socket = io({
-        transports: ['polling', 'websocket'],
-        upgrade: true
-    });
-
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('fileInput');
     const chosenName = document.getElementById('chosenName');
@@ -327,56 +322,42 @@ UPLOAD_PAGE_HTML = """
         if (e.dataTransfer.files.length > 0) setFile(e.dataTransfer.files[0]);
     });
 
-    function arrayBufferToBase64(buffer) {
-        let binary = '';
-        const bytes = new Uint8Array(buffer);
-        const chunkSize = 0x8000;
-        for (let i = 0; i < bytes.length; i += chunkSize) {
-            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-        }
-        return btoa(binary);
-    }
-
-    submitBtn.addEventListener('click', () => {
+    submitBtn.addEventListener('click', async () => {
         if (!selectedFile) {
             showStatus('Chưa chọn file!', true);
             return;
         }
-        const reader = new FileReader();
-        reader.onload = (evt) => {
-            const payload = {
-                filename: selectedFile.name,
-                content_b64: arrayBufferToBase64(evt.target.result),
-                filesize: selectedFile.size
-            };
-            if (socket.connected) {
-                socket.emit('upload_file', payload);
-                showStatus(`Đã gửi "${selectedFile.name}"`);
+
+        submitBtn.disabled = true;
+        showStatus(`Đang tải "${selectedFile.name}" lên...`, false);
+
+        try {
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+
+            const res = await fetch(window.location.pathname, {
+                method: 'POST',
+                body: formData
+            });
+
+            const text = await res.text();
+            let data = {};
+            try { data = JSON.parse(text); } catch (_) {}
+
+            if (res.ok) {
+                showStatus(`Đã upload thành công "${data.filename || selectedFile.name}"`, false);
                 selectedFile = null;
                 fileInput.value = '';
                 chosenName.textContent = 'Nhấn để chọn file hoặc kéo thả vào đây';
             } else {
-                const formData = new FormData();
-                formData.append('file', selectedFile);
-                fetch(window.location.pathname, { method: 'POST', body: formData })
-                    .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-                    .then(({ ok, data }) => {
-                        if (ok) {
-                            showStatus(`Đã upload "${data.filename}"`);
-                            selectedFile = null;
-                            fileInput.value = '';
-                            chosenName.textContent = 'Nhấn để chọn file hoặc kéo thả vào đây';
-                        } else {
-                            showStatus(data.error || 'Lỗi upload', true);
-                        }
-                    })
-                    .catch(err => showStatus('Lỗi kết nối: ' + err.message, true));
+                showStatus(`Lỗi upload (HTTP ${res.status}): ${data.error || text || 'Không rõ'}`, true);
             }
-        };
-        reader.readAsArrayBuffer(selectedFile);
+        } catch (err) {
+            showStatus('Lỗi kết nối khi upload: ' + err.message, true);
+        } finally {
+            submitBtn.disabled = false;
+        }
     });
-
-    socket.on('error_msg', (data) => showStatus('Lỗi DB: ' + data.error, true));
 </script>
 </body>
 </html>
@@ -413,7 +394,8 @@ def handle_upload_route():
         socketio.emit('new_file', files)
         return jsonify({"message": "OK", "filename": filename}), 201
     except Exception as e:
-        pass
+        print("[upload error]:", repr(e), flush=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/view/<int:file_id>')
@@ -438,7 +420,7 @@ def view_file(file_id):
                 )
             return raw_bytes.decode('utf-8', errors='replace'), 200, {'Content-Type': 'text/plain; charset=utf-8'}
     except Exception as e:
-        pass
+        print("[view_file error]:", repr(e), flush=True)
     return "File không tồn tại", 404
 
 
@@ -460,7 +442,7 @@ def download_file(file_id):
                 download_name=filename,
                 mimetype='application/octet-stream')
     except Exception as e:
-        pass
+        print("[download_file error]:", repr(e), flush=True)
     return "File không tồn tại", 404
 
 
@@ -481,7 +463,9 @@ def handle_upload_socket(data):
         files = save_binary_file(filename, raw, filesize)
         emit('new_file', files, broadcast=True)
     except Exception as e:
-        pass
+        print("[socket upload error]:", repr(e), flush=True)
+        emit('error_msg', {'error': str(e)})
+
 
 while True:
     port = int(os.environ.get("PORT", 5000))
